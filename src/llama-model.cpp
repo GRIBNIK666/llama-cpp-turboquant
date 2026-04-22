@@ -8152,7 +8152,17 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+
+        // When MoE cache lazy mmap is active, GPU contexts must NOT use the mmap path.
+        // Reason: attention and expert tensors are interleaved in the GGUF file, so the
+        // mmap range [first, last) for GPU tensors spans the entire file (~220 GB+),
+        // which exceeds Metal's working set and causes OOM.
+        // Instead, allocate a fresh GPU buffer (~6 GB for attention) and copy data into it.
+        // CPU expert tensors continue to use the mmap path for madvise-based caching.
+        const bool skip_mmap_for_gpu = ml.moe_cache_lazy_mmap &&
+            ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+
+        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !skip_mmap_for_gpu) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -8247,6 +8257,33 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    // Populate MoE expert tensor metadata for the cache
+    if (hparams.n_expert > 0) {
+        for (uint32_t il = 0; il < hparams.n_layer; il++) {
+            auto & layer = layers[il];
+            layer.moe_tensor_infos.clear();
+
+            auto add_info = [&](const ggml_tensor * t) {
+                if (!t || !t->data) return;
+                llama_expert_tensor_info info;
+                info.base_addr     = t->data;
+                info.expert_stride = t->nb[2];
+                info.n_expert      = t->ne[2];
+                layer.moe_tensor_infos.push_back(info);
+            };
+
+            if (layer.ffn_gate_up_exps) {
+                // Fused gate+up variant (2 tensors)
+                add_info(layer.ffn_gate_up_exps);
+            } else {
+                // Separate gate + up (3 tensors)
+                add_info(layer.ffn_gate_exps);
+                add_info(layer.ffn_up_exps);
+            }
+            add_info(layer.ffn_down_exps);
         }
     }
 
@@ -9347,6 +9384,10 @@ int32_t llama_model_n_head(const llama_model * model) {
 
 int32_t llama_model_n_head_kv(const llama_model * model) {
     return model->hparams.n_head_kv();
+}
+
+int32_t llama_model_n_expert(const llama_model * model) {
+    return model->hparams.n_expert;
 }
 
 int32_t llama_model_n_swa(const llama_model * model) {

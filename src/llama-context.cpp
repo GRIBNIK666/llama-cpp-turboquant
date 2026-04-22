@@ -367,6 +367,11 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (moe_cache) {
+        moe_cache->shutdown();
+        moe_cache.reset();
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -627,6 +632,44 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+void llama_context::init_moe_cache(int n_cache_experts, bool print_stats, const std::string & warmup_profile, int eviction_policy) {
+    if (n_cache_experts <= 0) return;
+    if (model.hparams.n_expert == 0) return;
+
+    llama_moe_cache_config config;
+    config.n_cache_experts  = n_cache_experts;
+    config.eviction_policy  = eviction_policy;
+    config.print_stats     = print_stats;
+
+    moe_cache = std::make_unique<llama_moe_cache>();
+    if (!moe_cache->init(config, model)) {
+        moe_cache.reset();
+        return;
+    }
+
+    // Populate per-layer tensor metadata from model
+    for (uint32_t il = 0; il < model.hparams.n_layer; il++) {
+        const auto & layer = model.layers[il];
+        if (!layer.moe_tensor_infos.empty()) {
+            moe_cache->set_layer_tensors(il, layer.moe_tensor_infos);
+        }
+    }
+
+    if (!moe_cache->finalize()) {
+        moe_cache.reset();
+        return;
+    }
+
+    // Release any expert pages that may have been touched during loading
+    moe_cache->release_all_expert_pages();
+
+    // Set profile path for auto-save on shutdown, and load if exists
+    if (!warmup_profile.empty()) {
+        moe_cache->profile_path = warmup_profile;
+        moe_cache->load_profile(warmup_profile);
+    }
 }
 
 void llama_context::synchronize() {
@@ -1228,11 +1271,44 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // Pre-graph prefetch: issue WILLNEED for predicted experts across all layers.
+    // Note: per-layer eval-callback prefetch was tested but the ~62 sync points
+    // per token cost more than the prefetch saves. Bulk prefetch is sufficient.
+    if (moe_cache && moe_cache->enabled() && moe_cache->has_profile_data()) {
+        moe_cache->prefetch_predicted_all_layers(model.hparams.n_expert_used);
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // Update MoE expert cache with router decisions
+    if (moe_cache && moe_cache->enabled() && !res->t_moe_topk.empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+
+        for (auto * node : res->t_moe_topk) {
+            if (!node || !node->buffer) continue;
+
+            // Extract layer ID from tensor name "ffn_moe_topk_out-{il}"
+            int il = -1;
+            if (sscanf(node->name, "ffn_moe_topk_out-%d", &il) != 1 || il < 0) continue;
+
+            // node shape: [n_expert_used, n_tokens], type I32
+            const int n_ids = (int)ggml_nelements(node);
+            std::vector<int32_t> expert_ids(n_ids);
+            ggml_backend_tensor_get(node, expert_ids.data(), 0, ggml_nbytes(node));
+
+            if (ubatch.n_tokens > 1) {
+                moe_cache->acquire_batch(il, expert_ids.data(), n_ids);
+            } else {
+                moe_cache->on_experts_used(il, expert_ids.data(), n_ids);
+            }
+        }
+
+        moe_cache->evict_cold();
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -3039,6 +3115,30 @@ llama_context * llama_new_context_with_model(
 
 void llama_free(llama_context * ctx) {
     delete ctx;
+}
+
+void llama_init_moe_cache(llama_context * ctx, int32_t n_cache_experts, bool print_stats, const char * warmup_profile, int32_t eviction_policy) {
+    if (ctx) {
+        ctx->init_moe_cache(n_cache_experts, print_stats, warmup_profile ? warmup_profile : "", eviction_policy);
+    }
+}
+
+llama_moe_cache_stats_data llama_moe_cache_get_stats(const llama_context * ctx) {
+    if (ctx) {
+        return ctx->get_moe_cache_stats();
+    }
+    return {};
+}
+
+llama_moe_cache_stats_data llama_context::get_moe_cache_stats() const {
+    llama_moe_cache_stats_data data = {};
+    if (moe_cache && moe_cache->enabled()) {
+        const auto & s = moe_cache->stats();
+        data.hits      = s.hits.load();
+        data.misses    = s.misses.load();
+        data.evictions = s.evictions.load();
+    }
+    return data;
 }
 
 uint32_t llama_n_ctx(const llama_context * ctx) {

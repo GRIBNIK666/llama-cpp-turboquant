@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-moe-cache.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -307,6 +308,10 @@ struct llama_layer {
     // ff MoE latent proj
     struct ggml_tensor * ffn_latent_down = nullptr;
     struct ggml_tensor * ffn_latent_up   = nullptr;
+
+    // MoE expert cache metadata (populated after tensor data is loaded)
+    // Contains info for each expert tensor: gate[_up], [up], down
+    std::vector<llama_expert_tensor_info> moe_tensor_infos;
 
     // ff shared expert (shexp)
     struct ggml_tensor * ffn_gate_inp_shexp = nullptr;

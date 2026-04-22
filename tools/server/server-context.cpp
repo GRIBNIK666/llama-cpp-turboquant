@@ -1948,6 +1948,14 @@ private:
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
 
+                    // MoE expert cache stats
+                    {
+                        auto moe_stats = llama_moe_cache_get_stats(ctx);
+                        res->moe_cache_hits      = moe_stats.hits;
+                        res->moe_cache_misses    = moe_stats.misses;
+                        res->moe_cache_evictions = moe_stats.evictions;
+                    }
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -3487,6 +3495,24 @@ void server_routes::init_routes() {
                     {"name",  "requests_deferred"},
                     {"help",  "Number of requests deferred."},
                     {"value",  (uint64_t) res_task->n_tasks_deferred}
+            },{
+                    {"name",  "moe_cache_hits_total"},
+                    {"help",  "MoE expert cache hits."},
+                    {"value",  (uint64_t) res_task->moe_cache_hits}
+            },{
+                    {"name",  "moe_cache_misses_total"},
+                    {"help",  "MoE expert cache misses."},
+                    {"value",  (uint64_t) res_task->moe_cache_misses}
+            },{
+                    {"name",  "moe_cache_evictions_total"},
+                    {"help",  "MoE expert cache evictions."},
+                    {"value",  (uint64_t) res_task->moe_cache_evictions}
+            },{
+                    {"name",  "moe_cache_hit_rate"},
+                    {"help",  "MoE expert cache hit rate."},
+                    {"value",  (res_task->moe_cache_hits + res_task->moe_cache_misses) > 0
+                        ? (double) res_task->moe_cache_hits / (double)(res_task->moe_cache_hits + res_task->moe_cache_misses)
+                        : 0.0}
             }}}
         };
 

@@ -461,6 +461,14 @@ struct common_params {
     struct common_params_vocoder     vocoder;
     struct common_params_diffusion   diffusion;
 
+    // MoE expert cache
+    float   moe_cache_experts       = 0.0f;  // 0=disabled, 0<v<=1.0=fraction of total, >1=exact count
+    int32_t moe_cache_policy        = 0;     // 0 = LRU
+    bool    moe_cache_stats         = false; // print cache stats on shutdown
+    std::string moe_warmup_profile;          // path to save/load expert access profile
+
+
+
     struct common_params_model model;
 
     std::set<std::string> model_alias;     // model aliases                                                 // NOLINT

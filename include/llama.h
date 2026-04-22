@@ -563,6 +563,23 @@ extern "C" {
 
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
+
+    // Initialize the MoE expert cache for the given context
+    //   n_cache_experts:  max experts to keep resident via madvise (0 = disabled)
+    //   print_stats:      print cache stats on context destruction
+    //   warmup_profile:   path to save/load expert access profile (NULL = disabled)
+    //                     if file exists, loads it and pre-fetches hot experts
+    //                     on shutdown, saves current access pattern to this file
+    LLAMA_API void llama_init_moe_cache(struct llama_context * ctx, int32_t n_cache_experts, bool print_stats, const char * warmup_profile, int32_t eviction_policy);
+
+    // MoE cache statistics (all zero if cache is not active)
+    struct llama_moe_cache_stats_data {
+        uint64_t hits;
+        uint64_t misses;
+        uint64_t evictions;
+    };
+    LLAMA_API struct llama_moe_cache_stats_data llama_moe_cache_get_stats(const struct llama_context * ctx);
+
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
@@ -575,6 +592,7 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_layer    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head     (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_expert   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa      (const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor

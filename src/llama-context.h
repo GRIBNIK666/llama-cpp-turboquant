@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
+#include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -50,6 +51,14 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+
+    // Initialize the MoE expert cache (call after context creation)
+    void init_moe_cache(int n_cache_experts, bool print_stats, const std::string & warmup_profile = "", int eviction_policy = 0);
+
+
+
+    // Get MoE cache stats (returns null stats if cache is not active)
+    llama_moe_cache_stats_data get_moe_cache_stats() const;
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -264,6 +273,9 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     std::unique_ptr<llama_memory_i> memory;
+
+    // MoE expert cache (nullptr if disabled or model has no experts)
+    std::unique_ptr<llama_moe_cache> moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
