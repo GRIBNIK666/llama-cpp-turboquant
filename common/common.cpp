@@ -1147,6 +1147,38 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params) :
     pimpl(new impl{}) {
+    // --moe-cache-experts implies --cpu-moe (experts must be mmap'd for madvise to work)
+    if (params.moe_cache_experts > 0.0f) {
+        // Check if --cpu-moe was already set by looking for the override
+        bool has_cpu_moe = false;
+        for (const auto & ov : params.tensor_buft_overrides) {
+            if (ov.buft == ggml_backend_cpu_buffer_type()) {
+                has_cpu_moe = true;
+                break;
+            }
+        }
+        if (!has_cpu_moe) {
+            // Insert before the null terminator if present, or append + add terminator
+            if (!params.tensor_buft_overrides.empty() && params.tensor_buft_overrides.back().pattern == nullptr) {
+                params.tensor_buft_overrides.insert(params.tensor_buft_overrides.end() - 1, llm_ffn_exps_cpu_override());
+            } else {
+                params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+                params.tensor_buft_overrides.push_back({nullptr, nullptr});
+            }
+        }
+    }
+
+    // Enable lazy mmap for expert tensors when MoE cache is active
+    // Must be set before fit pass and model load — both load the model
+    if (params.moe_cache_experts > 0.0f) {
+        if (params.use_mmap) {
+            setenv("LLAMA_MOE_CACHE_LAZY_MMAP", "1", 1);
+            LOG_INF("%s: MoE cache lazy mmap enabled\n", __func__);
+        } else {
+            LOG_WRN("%s: MoE cache requires mmap, but use_mmap is false\n", __func__);
+        }
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1161,6 +1193,10 @@ common_init_result::common_init_result(common_params & params) :
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+
+    // Clean up env var after model load
+    unsetenv("LLAMA_MOE_CACHE_LAZY_MMAP");
+
     if (model == NULL) {
         return;
     }
@@ -1240,6 +1276,24 @@ common_init_result::common_init_result(common_params & params) :
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
         return;
+    }
+
+    // Initialize MoE expert cache if requested
+    if (params.moe_cache_experts > 0.0f) {
+        int32_t n_cache_experts;
+        if (params.moe_cache_experts <= 1.0f) {
+            // Fraction of total experts
+            int32_t n_expert = llama_model_n_expert(model);
+            int32_t n_layer  = llama_model_n_layer(model);
+            n_cache_experts  = (int32_t)(params.moe_cache_experts * n_expert * n_layer);
+        } else {
+            n_cache_experts = (int32_t)params.moe_cache_experts;
+        }
+        if (n_cache_experts > 0) {
+            llama_init_moe_cache(lctx, n_cache_experts, params.moe_cache_stats,
+                                 params.moe_warmup_profile.empty() ? nullptr : params.moe_warmup_profile.c_str(),
+                                 params.moe_cache_policy);
+        }
     }
 
     pimpl->context.reset(lctx);
@@ -1431,6 +1485,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    // TODO: lazy mmap for expert tensors (skip copy during load) — needs deeper integration
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

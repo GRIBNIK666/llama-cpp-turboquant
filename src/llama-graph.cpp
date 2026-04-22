@@ -792,6 +792,7 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_moe_topk.clear();
 
     params = {};
 
@@ -842,6 +843,11 @@ void llm_graph_result::set_outputs() {
         }
     }
     for (auto & [seq_id, t] : t_candidates) {
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
+    }
+    for (auto * t : t_moe_topk) {
         if (t != nullptr) {
             ggml_set_output(t);
         }
@@ -1359,6 +1365,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
 
+    // Store for MoE cache post-compute readback (marked as output in set_outputs).
+    // ggml_cont() materializes the view returned by ggml_argsort_top_k into an
+    // independent tensor — without this, ggml_set_output on the view does NOT
+    // prevent the allocator from freeing the underlying argsort buffer.
+    {
+        ggml_tensor * topk_copy = ggml_cont(ctx0, selected_experts);
+        cb(topk_copy, "ffn_moe_topk_out", il);
+        ggml_build_forward_expand(gf, topk_copy);
+        res->t_moe_topk.push_back(topk_copy);
+    }
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -1575,23 +1592,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     assert(n_expert_used > 0);
 
     // order the views before the adds
-    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+    for (int64_t i = 0; i < n_expert_used; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
         ggml_build_forward_expand(gf, cur_experts[i]);
     }
 
     // aggregate experts
-    // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
-    //       to avoid potentially a large number of add nodes during warmup
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
     ggml_tensor * moe_out = cur_experts[0];
 
-    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+    for (int64_t i = 1; i < n_expert_used; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
     }
 
-    if (hparams.n_expert_used == 1) {
+    if (n_expert_used == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
     }

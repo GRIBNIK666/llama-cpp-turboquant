@@ -365,6 +365,11 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (moe_cache) {
+        moe_cache->shutdown();
+        moe_cache.reset();
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -625,6 +630,44 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+void llama_context::init_moe_cache(int n_cache_experts, bool print_stats, const std::string & warmup_profile, int eviction_policy) {
+    if (n_cache_experts <= 0) return;
+    if (model.hparams.n_expert == 0) return;
+
+    llama_moe_cache_config config;
+    config.n_cache_experts  = n_cache_experts;
+    config.eviction_policy  = eviction_policy;
+    config.print_stats     = print_stats;
+
+    moe_cache = std::make_unique<llama_moe_cache>();
+    if (!moe_cache->init(config, model)) {
+        moe_cache.reset();
+        return;
+    }
+
+    // Populate per-layer tensor metadata from model
+    for (uint32_t il = 0; il < model.hparams.n_layer; il++) {
+        const auto & layer = model.layers[il];
+        if (!layer.moe_tensor_infos.empty()) {
+            moe_cache->set_layer_tensors(il, layer.moe_tensor_infos);
+        }
+    }
+
+    if (!moe_cache->finalize()) {
+        moe_cache.reset();
+        return;
+    }
+
+    // Release any expert pages that may have been touched during loading
+    moe_cache->release_all_expert_pages();
+
+    // Set profile path for auto-save on shutdown, and load if exists
+    if (!warmup_profile.empty()) {
+        moe_cache->profile_path = warmup_profile;
+        moe_cache->load_profile(warmup_profile);
+    }
 }
 
 void llama_context::synchronize() {
@@ -1164,6 +1207,42 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// ═══════════════════════════════════════════════════
+// MoE prefetch eval callback — prefetch layer N+1's experts during layer N's compute
+// ═══════════════════════════════════════════════════
+
+struct moe_prefetch_cb_data {
+    llama_moe_cache * cache;
+    int n_layers;
+
+    ggml_backend_sched_eval_callback user_cb;
+    void * user_cb_data;
+};
+
+static bool moe_prefetch_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * data = static_cast<moe_prefetch_cb_data *>(user_data);
+
+    int il = -1;
+    bool is_topk = (sscanf(t->name, "ffn_moe_topk_out-%d", &il) == 1 && il >= 0);
+
+    if (ask) {
+        if (is_topk && il + 1 < data->n_layers) return true;
+        if (data->user_cb) return data->user_cb(t, true, data->user_cb_data);
+        return false;
+    }
+
+    // ask == false: tensor data available — prefetch next layer's experts
+    if (is_topk && il + 1 < data->n_layers) {
+        const int n_ids = (int)ggml_nelements(t);
+        std::vector<int32_t> expert_ids(n_ids);
+        ggml_backend_tensor_get(t, expert_ids.data(), 0, ggml_nbytes(t));
+        data->cache->prefetch_experts(il + 1, expert_ids.data(), n_ids);
+    }
+
+    if (data->user_cb) return data->user_cb(t, false, data->user_cb_data);
+    return true;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1224,11 +1303,46 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // Note: eval callback prefetch was tested but the per-layer sync overhead
+    // (~62 sync points per token) costs more than the prefetch saves.
+    // The pre-graph bulk prefetch below is sufficient.
+
+    // Pre-graph prefetch: issue WILLNEED for predicted experts across all layers
+    if (moe_cache && moe_cache->enabled() && moe_cache->has_profile_data()) {
+        moe_cache->prefetch_predicted_all_layers(model.hparams.n_expert_used);
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // Update MoE expert cache with router decisions
+    if (moe_cache && moe_cache->enabled() && !res->t_moe_topk.empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+
+        for (auto * node : res->t_moe_topk) {
+            if (!node || !node->buffer) continue;
+
+            // Extract layer ID from tensor name "ffn_moe_topk-{il}"
+            int il = -1;
+            if (sscanf(node->name, "ffn_moe_topk_out-%d", &il) != 1 || il < 0) continue;
+
+            // node shape: [n_expert_used, n_tokens], type I32
+            const int n_ids = (int)ggml_nelements(node);
+            std::vector<int32_t> expert_ids(n_ids);
+            ggml_backend_tensor_get(node, expert_ids.data(), 0, ggml_nbytes(node));
+
+            if (ubatch.n_tokens > 1) {
+                moe_cache->acquire_batch(il, expert_ids.data(), n_ids);
+            } else {
+                moe_cache->on_experts_used(il, expert_ids.data(), n_ids);
+            }
+        }
+
+        moe_cache->evict_cold();
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -3020,6 +3134,32 @@ llama_context * llama_new_context_with_model(
 
 void llama_free(llama_context * ctx) {
     delete ctx;
+}
+
+void llama_init_moe_cache(llama_context * ctx, int32_t n_cache_experts, bool print_stats, const char * warmup_profile, int32_t eviction_policy) {
+    if (ctx) {
+        ctx->init_moe_cache(n_cache_experts, print_stats, warmup_profile ? warmup_profile : "", eviction_policy);
+    }
+}
+
+
+
+llama_moe_cache_stats_data llama_moe_cache_get_stats(const llama_context * ctx) {
+    if (ctx) {
+        return ctx->get_moe_cache_stats();
+    }
+    return {};
+}
+
+llama_moe_cache_stats_data llama_context::get_moe_cache_stats() const {
+    llama_moe_cache_stats_data data = {};
+    if (moe_cache && moe_cache->enabled()) {
+        const auto & s = moe_cache->stats();
+        data.hits      = s.hits.load();
+        data.misses    = s.misses.load();
+        data.evictions = s.evictions.load();
+    }
+    return data;
 }
 
 uint32_t llama_n_ctx(const llama_context * ctx) {

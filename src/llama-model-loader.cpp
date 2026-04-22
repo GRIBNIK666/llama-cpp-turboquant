@@ -526,6 +526,13 @@ llama_model_loader::llama_model_loader(
         trace = atoi(getenv("LLAMA_TRACE"));
     }
 
+    if (getenv("LLAMA_MOE_CACHE_LAZY_MMAP")) {
+        moe_cache_lazy_mmap = atoi(getenv("LLAMA_MOE_CACHE_LAZY_MMAP")) != 0;
+        if (moe_cache_lazy_mmap) {
+            LLAMA_LOG_INFO("%s: MoE cache lazy mmap ENABLED — expert tensors will use mmap directly\n", __func__);
+        }
+    }
+
     if (param_overrides_p != nullptr) {
         for (const struct llama_model_kv_override * p = param_overrides_p; p->key[0] != 0; p++) {
             kv_overrides.insert({std::string(p->key), *p});
@@ -1160,6 +1167,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                        if (moe_cache_lazy_mmap) {
+                            // When MoE cache lazy mmap is enabled, check if this is an expert tensor.
+                            // If so, use the default CPU buffer type (not CPU_REPACK) so it flows
+                            // through the mmap path (is_default_buft=true) and avoids copying data.
+                            static const std::regex expert_re("\\.ffn_(up|down|gate|gate_up)_(ch|)exps");
+                            if (std::regex_search(tensor_name, expert_re)) {
+                                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                                buft = ggml_backend_dev_buffer_type(cpu_dev);
+                                LLAMA_LOG_DEBUG("tensor %s: using mmap (MoE cache lazy load)\n",
+                                        tensor_name.c_str());
+                                break;
+                            }
+                        }
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
                         if (use_mmap) {
@@ -1185,6 +1205,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
+            }
+
+            // When lazy mmap is enabled, force expert tensors to the default CPU buft
+            // (skip CPU_REPACK) so they go through mmap Path A without data copying
+            if (moe_cache_lazy_mmap && buft != ggml_backend_dev_buffer_type(
+                    ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU))) {
+                static const std::regex expert_re("\\.ffn_(up|down|gate|gate_up)_(ch|)exps");
+                std::string tensor_name = tn.str();
+                if (std::regex_search(tensor_name, expert_re)) {
+                    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                    buft = ggml_backend_dev_buffer_type(cpu_dev);
+                    LLAMA_LOG_DEBUG("tensor %s: using mmap (MoE cache lazy load)\n",
+                            tensor_name.c_str());
+                }
             }
         }
 
@@ -1536,9 +1570,20 @@ bool llama_model_loader::load_all_data(
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
             if (check_tensors) {
-                validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
-                    return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
-                }));
+                // Skip validation for expert tensors when lazy mmap is enabled
+                // to avoid reading their pages during load
+                bool skip_validation = false;
+                if (moe_cache_lazy_mmap) {
+                    static const std::regex expert_re("\\.ffn_(up|down|gate|gate_up)_(ch|)exps");
+                    if (std::regex_search(std::string(ggml_get_name(cur)), expert_re)) {
+                        skip_validation = true;
+                    }
+                }
+                if (!skip_validation) {
+                    validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
+                        return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
+                    }));
+                }
             }
 
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated

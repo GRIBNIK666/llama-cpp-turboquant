@@ -675,6 +675,9 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_sampled;
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
 
+    // MoE router outputs per layer — marked as output so memory persists after compute
+    std::vector<ggml_tensor*> t_moe_topk;
+
     std::vector<llm_graph_input_ptr> inputs;
 
     ggml_context_ptr ctx_compute;

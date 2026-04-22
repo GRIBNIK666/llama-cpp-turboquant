@@ -2331,6 +2331,46 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_CPU_MOE_DRAFT"));
+    add_opt(common_arg(
+        {"--moe-cache-experts"}, "N",
+        "MoE experts to keep resident via madvise (0 = disabled, default: 0)\n"
+        "values 0.0-1.0 = fraction of total experts (e.g. 0.2 = 20%%)\n"
+        "values > 1 = exact number of experts (e.g. 500)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_experts = std::stof(value);
+            if (params.moe_cache_experts < 0.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_EXPERTS"));
+    add_opt(common_arg(
+        {"--moe-cache-stats"},
+        "print MoE expert cache statistics on shutdown",
+        [](common_params & params) {
+            params.moe_cache_stats = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_STATS"));
+    add_opt(common_arg(
+        {"--moe-cache-policy"}, "lru|slru",
+        "eviction policy for MoE expert cache (default: lru)\n"
+        "slru protects frequently-used experts from being evicted by one-time accesses",
+        [](common_params & params, const std::string & value) {
+            if (value == "lru") {
+                params.moe_cache_policy = 0;  // LLAMA_MOE_CACHE_LRU
+            } else if (value == "slru") {
+                params.moe_cache_policy = 1;  // LLAMA_MOE_CACHE_SLRU
+            } else {
+                throw std::invalid_argument("unknown policy: " + value + " (use lru or slru)");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_POLICY"));
+    add_opt(common_arg(
+        {"--moe-warmup-profile"}, "PATH",
+        "path to save/load MoE expert access profile for warm starts between runs",
+        [](common_params & params, const std::string & value) {
+            params.moe_warmup_profile = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_WARMUP_PROFILE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
