@@ -247,6 +247,12 @@ llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 
+# MoE expert cache tests: both require a GGUF model passed as argv[1] and so
+# cannot run in CI. Registered with LABEL "model" so they BUILD but are excluded
+# from the default ctest run (same as the other model-dependent tests above).
+llama_build_and_test(test-moe-cache-init.cpp    LABEL "model")
+llama_build_and_test(model-info.cpp             LABEL "model")
+
 # Test for state restore with fragmented KV cache
 # Requires a model, uses same args pattern as test-thread-safety
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")

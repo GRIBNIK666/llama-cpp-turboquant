@@ -39,7 +39,8 @@ int main(int argc, char ** argv) {
     }
 
     fprintf(stderr, "Initializing MoE cache with 64 experts + profile...\n");
-    llama_init_moe_cache(ctx, 64, true, profile_path);
+    // eviction_policy 0 == LLAMA_MOE_CACHE_LRU (default; enum is internal-only)
+    llama_init_moe_cache(ctx, 64, true, profile_path, 0);
 
     // Check stats
     auto stats = llama_moe_cache_get_stats(ctx);
