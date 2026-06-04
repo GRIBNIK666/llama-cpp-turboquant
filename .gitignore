@@ -160,3 +160,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# local-only MoE cache planning doc + run script (scrubbed from history)
+/moe-cache-plan.md
+/run.sh
