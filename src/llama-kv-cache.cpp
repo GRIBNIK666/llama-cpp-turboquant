@@ -67,6 +67,7 @@ static ggml_tensor * ggml_mul_mat_aux(
 
     res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
     res = ggml_mul_mat   (ctx, rot, res);
+    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
     res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
 
     return res;
@@ -90,10 +91,10 @@ extern TURBO_IQ_IMPORT float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS];
 TURBO_IQ_IMPORT bool turbo_innerq_needs_tensor_update(void);
 TURBO_IQ_IMPORT void turbo_innerq_mark_tensor_updated(void);
 #else
-static bool  g_innerq_finalized = false;
-static float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS] = {};
-static bool turbo_innerq_needs_tensor_update(void) { return false; }
-static void turbo_innerq_mark_tensor_updated(void) {}
+[[maybe_unused]] static bool  g_innerq_finalized = false;
+[[maybe_unused]] static float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS] = {};
+[[maybe_unused]] static bool turbo_innerq_needs_tensor_update(void) { return false; }
+[[maybe_unused]] static void turbo_innerq_mark_tensor_updated(void) {}
 #endif
 
 //
@@ -118,6 +119,32 @@ llama_kv_cache::llama_kv_cache(
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
+
+    // Auto-asymmetric: when symmetric turbo K+V is requested and the model has
+    // high GQA ratio (few KV heads serving many Q heads), upgrade K to q8_0.
+    // Turbo K quantization error gets amplified by the GQA broadcast factor.
+    // Qwen2.5: 4 KV heads / 28 Q heads = 7:1 → turbo3 K PPL catastrophic (2887 vs 7.4 baseline)
+    // Mistral:  8 KV heads / 32 Q heads = 4:1 → turbo3 K works fine (+4.4% PPL)
+    // Threshold: GQA ratio >= 6 triggers auto-asymmetric.
+    {
+        const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
+        if (k_is_turbo) {
+            const uint32_t n_head    = hparams.n_head(0);
+            const uint32_t n_head_kv = hparams.n_head_kv(0);
+            const uint32_t gqa_ratio = (n_head_kv > 0) ? n_head / n_head_kv : 1;
+
+            const char * env = getenv("TURBO_AUTO_ASYMMETRIC");
+            const bool disabled = (env && env[0] == '0');
+
+            if (!disabled && gqa_ratio >= 6 && type_k == type_v) {
+                LLAMA_LOG_WARN("%s: auto-asymmetric: GQA ratio %u:1 (n_head=%u, n_head_kv=%u) — "
+                               "upgrading K from %s to q8_0 to prevent quality degradation. "
+                               "Disable with TURBO_AUTO_ASYMMETRIC=0\n",
+                               __func__, gqa_ratio, n_head, n_head_kv, ggml_type_name(type_k));
+                type_k = GGML_TYPE_Q8_0;
+            }
+        }
+    }
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
@@ -436,28 +463,62 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
-    // TurboQuant: disable upstream graph-level activation rotation by default.
-    // Our fork uses kernel-level WHT rotation (simd_shuffle_xor in Metal/CUDA)
-    // which is independent and more efficient. The upstream rotation adds extra
-    // graph nodes that cause hash table overflow on some models (e.g. Phi-4).
-    // Users can re-enable with LLAMA_ATTN_ROT_DISABLE=0 if needed.
+    // TurboQuant: master's #21038 attention rotation is OFF by default on this
+    // fork. Enable per-side via LLAMA_ATTN_ROT_K_OVERRIDE=1 and/or
+    // LLAMA_ATTN_ROT_V_OVERRIDE=1 if your specific model+KV combo benefits.
+    //
+    // Why default OFF: empirical PPL+KLD testing on 7 model families
+    // (gemma-4 26B-A4B/31B/E2B, Qwen2.5-7B, Qwen3.5-2B, Mistral-Small-24B,
+    // phi-4, on q8/turbo4 KV) showed the optimal rotation policy is highly
+    // model-and-quant specific:
+    //
+    //   • gemma-4 31B Q8 q8/turbo4: V-only rotation gives -43% PPL (huge win).
+    //   • gemma-4 26B-A4B Q8 q8/turbo4: V-only gives -3.9%.
+    //   • gemma-4 E2B Q4_K_L q8/turbo4: V-only HURTS by +6.7%.
+    //   • phi-4 Q8 q8/turbo4: V-side rotation crashes (graph hash overflow).
+    //   • Qwen2.5/3.5/Mistral: rotation effect is within standard error.
+    //
+    // No single default is correct everywhere, including within the same
+    // architecture family (gemma-4 above shows three distinct optima across
+    // three sizes). Per-arch heuristics in code would silently regress users
+    // on variants we haven't tested. Default OFF + per-side env knobs lets
+    // each user tune for their specific config; documented findings in the
+    // README guide the choice.
+    //
+    // Reported by @erazortt (TheTom/turboquant_plus#88).
+    //
+    // LLAMA_ATTN_ROT_DISABLE retained as a no-op alias (default OFF makes it
+    // redundant but historical scripts may set it).
+    // Default attn_rot_disable=false now that rotation is OFF by default. The
+    // env var is preserved as a hard lock-out (=1 forces rotation off and
+    // blocks overrides), useful for users who want to guarantee no rotation
+    // regardless of any LLAMA_ATTN_ROT_*_OVERRIDE settings.
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
-    const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : true;
-    if (attn_rot_disable) {
-        LLAMA_LOG_INFO("%s: upstream attention rotation disabled (TurboQuant uses kernel-level WHT)\n", __func__);
+    const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? (atoi(LLAMA_ATTN_ROT_DISABLE) != 0) : false;
+
+    // Default: rotation OFF on both sides (safe across all tested model families).
+    // Override per side via env vars below.
+    attn_rot_k = false;
+    attn_rot_v = false;
+
+    // Per-side overrides. Set LLAMA_ATTN_ROT_K_OVERRIDE=1 / LLAMA_ATTN_ROT_V_OVERRIDE=1
+    // to enable rotation. The cache type and head-dim alignment guards below
+    // still apply: rotation only takes effect on quantized types with
+    // head_dim % 64 == 0 (master's #21038 requirements).
+    const char * ROT_K_OV = getenv("LLAMA_ATTN_ROT_K_OVERRIDE");
+    if (ROT_K_OV && atoi(ROT_K_OV) != 0 && !attn_rot_disable) {
+        attn_rot_k =
+            n_embd_head_k_all > 0 &&
+            ggml_is_quantized(type_k) &&
+            hparams.n_embd_head_k() % 64 == 0;
     }
-
-    attn_rot_k =
-        !attn_rot_disable &&
-        n_embd_head_k_all > 0 &&
-        ggml_is_quantized(type_k) &&
-        hparams.n_embd_head_k() % 64 == 0;
-
-    attn_rot_v =
-        !attn_rot_disable &&
-        n_embd_head_v_all > 0 &&
-        ggml_is_quantized(type_v) &&
-        hparams.n_embd_head_v() % 64 == 0;
+    const char * ROT_V_OV = getenv("LLAMA_ATTN_ROT_V_OVERRIDE");
+    if (ROT_V_OV && atoi(ROT_V_OV) != 0 && !attn_rot_disable) {
+        attn_rot_v =
+            n_embd_head_v_all > 0 &&
+            ggml_is_quantized(type_v) &&
+            hparams.n_embd_head_v() % 64 == 0;
+    }
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
@@ -1541,14 +1602,23 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_k) {
-        int nrot = 64;
-
-        // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
+        // EXPERIMENT (master TODO): force smallest rotation matrix (nrot=64)
+        // for K, mirroring V's choice. Master defaults to the largest power-of-2
+        // that divides head_dim, but the upstream comment hypothesizes smaller
+        // tiles preserve more local structure → less PPL hit on sensitive models
+        // (gemma-4 26B-A4B reportedly regresses with the largest tile).
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-        do {
-            nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
-        nrot /= 2;
+        const char * LLAMA_ATTN_ROT_K_NROT = getenv("LLAMA_ATTN_ROT_K_NROT");
+        int nrot = LLAMA_ATTN_ROT_K_NROT ? atoi(LLAMA_ATTN_ROT_K_NROT) : 64;
+
+        // Original master behavior (largest power-of-2): set LLAMA_ATTN_ROT_K_NROT=0
+        if (nrot == 0) {
+            nrot = 64;
+            do {
+                nrot *= 2;
+            } while (n_embd_head_k_all % nrot == 0);
+            nrot /= 2;
+        }
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
@@ -2127,14 +2197,14 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
     uint32_t n_stream_cur;
-    io.read_to(&n_stream_cur, sizeof(n_stream_cur));
+    io.read(&n_stream_cur, sizeof(n_stream_cur));
     if (n_stream_cur != n_stream) {
         throw std::runtime_error("n_stream mismatch");
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         uint32_t cell_count;
-        io.read_to(&cell_count, sizeof(cell_count));
+        io.read(&cell_count, sizeof(cell_count));
 
         if (cell_count == 0) {
             continue;
@@ -2204,8 +2274,6 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
     for (const auto & layer : layers) {
-        const uint32_t il = layer.il;
-
         auto * k = layer.k_stream[cr.strm];
 
         // Use actual tensor width (may be padded for turbo types: e.g. 576→640)
@@ -2229,8 +2297,6 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
     if (!v_trans) {
         for (const auto & layer : layers) {
-            const uint32_t il = layer.il;
-
             auto * v = layer.v_stream[cr.strm];
             if (!v) {
                 continue;
@@ -2311,8 +2377,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             llama_pos pos;
             uint32_t n_seq_id;
 
-            io.read_to(&pos,      sizeof(pos));
-            io.read_to(&n_seq_id, sizeof(n_seq_id));
+            io.read(&pos,      sizeof(pos));
+            io.read(&n_seq_id, sizeof(n_seq_id));
 
             if (n_seq_id != 1) {
                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
@@ -2321,7 +2387,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             if (hparams.n_pos_per_embd() > 1) {
                 llama_kv_cell_ext ext;
-                io.read_to(&ext, sizeof(ext));
+                io.read(&ext, sizeof(ext));
 
                 ubatch.pos[i + ubatch.n_tokens]   = ext.y;
                 ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
@@ -2330,7 +2396,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             // read the sequence id, but directly discard it - we will use dest_seq_id instead
             {
                 llama_seq_id seq_id;
-                io.read_to(&seq_id, sizeof(seq_id));
+                io.read(&seq_id, sizeof(seq_id));
             }
 
             ubatch.pos[i]      = pos;
@@ -2372,20 +2438,20 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             llama_pos pos;
             uint32_t  n_seq_id;
 
-            io.read_to(&pos,      sizeof(pos));
-            io.read_to(&n_seq_id, sizeof(n_seq_id));
+            io.read(&pos,      sizeof(pos));
+            io.read(&n_seq_id, sizeof(n_seq_id));
 
             cells.pos_set(i, pos);
 
             if (hparams.n_pos_per_embd() > 1) {
                 llama_kv_cell_ext ext;
-                io.read_to(&ext, sizeof(ext));
+                io.read(&ext, sizeof(ext));
                 cells.ext_set(i, ext);
             }
 
             for (uint32_t j = 0; j < n_seq_id; ++j) {
                 llama_seq_id seq_id;
-                io.read_to(&seq_id, sizeof(seq_id));
+                io.read(&seq_id, sizeof(seq_id));
 
                 if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
                     LLAMA_LOG_ERROR("%s: invalid seq_id, %d is out of range [0, %u)\n", __func__, seq_id, n_seq_max);
@@ -2418,8 +2484,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     uint32_t v_trans;
     uint32_t n_layer;
 
-    io.read_to(&v_trans, sizeof(v_trans));
-    io.read_to(&n_layer, sizeof(n_layer));
+    io.read(&v_trans, sizeof(v_trans));
+    io.read(&n_layer, sizeof(n_layer));
 
     if (n_layer != layers.size()) {
         LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, (uint32_t) layers.size());
@@ -2447,7 +2513,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
         // Read type of key
         int32_t k_type_i_ref;
-        io.read_to(&k_type_i_ref, sizeof(k_type_i_ref));
+        io.read(&k_type_i_ref, sizeof(k_type_i_ref));
         const int32_t k_type_i = (int32_t) k->type;
         if (k_type_i != k_type_i_ref) {
             LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
@@ -2456,7 +2522,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
         // Read row size of key
         uint64_t k_size_row_ref;
-        io.read_to(&k_size_row_ref, sizeof(k_size_row_ref));
+        io.read(&k_size_row_ref, sizeof(k_size_row_ref));
         const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
         if (k_size_row != k_size_row_ref) {
             LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
@@ -2466,13 +2532,12 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         if (cell_count) {
             if (sinfo.is_contiguous()) {
                 // Fast path: contiguous cells, single memcpy
-                ggml_backend_tensor_set(k, io.read(cell_count * k_size_row), sinfo.head() * k_size_row, cell_count * k_size_row);
+                io.read_tensor(k, sinfo.head() * k_size_row, cell_count * k_size_row);
             } else {
                 // Slow path: scatter to non-contiguous positions
-                const void * src = io.read(cell_count * k_size_row);
                 for (uint32_t i = 0; i < cell_count; ++i) {
                     const size_t dst_offset = sinfo.idxs[0][i] * k_size_row;
-                    ggml_backend_tensor_set(k, (const char*)src + i * k_size_row, dst_offset, k_size_row);
+                    io.read_tensor(k, dst_offset, k_size_row);
                 }
             }
         }
@@ -2492,7 +2557,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
             // Read type of value
             int32_t v_type_i_ref;
-            io.read_to(&v_type_i_ref, sizeof(v_type_i_ref));
+            io.read(&v_type_i_ref, sizeof(v_type_i_ref));
             const int32_t v_type_i = (int32_t) v->type;
             if (v_type_i != v_type_i_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
@@ -2501,7 +2566,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
             // Read row size of value
             uint64_t v_size_row_ref;
-            io.read_to(&v_size_row_ref, sizeof(v_size_row_ref));
+            io.read(&v_size_row_ref, sizeof(v_size_row_ref));
             const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
             if (v_size_row != v_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
@@ -2511,13 +2576,12 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             if (cell_count) {
                 if (sinfo.is_contiguous()) {
                     // Fast path: contiguous cells, single memcpy
-                    ggml_backend_tensor_set(v, io.read(cell_count * v_size_row), sinfo.head() * v_size_row, cell_count * v_size_row);
+                    io.read_tensor(v, sinfo.head() * v_size_row, cell_count * v_size_row);
                 } else {
                     // Slow path: scatter to non-contiguous positions
-                    const void * src = io.read(cell_count * v_size_row);
                     for (uint32_t i = 0; i < cell_count; ++i) {
                         const size_t dst_offset = sinfo.idxs[0][i] * v_size_row;
-                        ggml_backend_tensor_set(v, (const char*)src + i * v_size_row, dst_offset, v_size_row);
+                        io.read_tensor(v, dst_offset, v_size_row);
                     }
                 }
             }
@@ -2536,7 +2600,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
             // Read type of value
             int32_t v_type_i_ref;
-            io.read_to(&v_type_i_ref, sizeof(v_type_i_ref));
+            io.read(&v_type_i_ref, sizeof(v_type_i_ref));
             const int32_t v_type_i = (int32_t) v->type;
             if (v_type_i != v_type_i_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
@@ -2545,7 +2609,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
             // Read element size of value
             uint32_t v_size_el_ref;
-            io.read_to(&v_size_el_ref, sizeof(v_size_el_ref));
+            io.read(&v_size_el_ref, sizeof(v_size_el_ref));
             const size_t v_size_el = ggml_type_size(v->type);
             if (v_size_el != v_size_el_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched value element size (%zu != %zu, layer %d)\n", __func__, v_size_el, (size_t) v_size_el_ref, il);
@@ -2554,7 +2618,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
             // Read GQA embedding size
             uint32_t n_embd_v_gqa_ref;
-            io.read_to(&n_embd_v_gqa_ref, sizeof(n_embd_v_gqa_ref));
+            io.read(&n_embd_v_gqa_ref, sizeof(n_embd_v_gqa_ref));
             if (n_embd_v_gqa != n_embd_v_gqa_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched GQA embedding size (%u != %u, layer %d)\n", __func__, n_embd_v_gqa, n_embd_v_gqa_ref, il);
                 return false;
@@ -2566,15 +2630,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                     const uint32_t h = sinfo.head();
                     for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                         const size_t dst_offset = (h + j * cells.size()) * v_size_el;
-                        ggml_backend_tensor_set(v, io.read(cell_count * v_size_el), dst_offset, cell_count * v_size_el);
+                        io.read_tensor(v, dst_offset, cell_count * v_size_el);
                     }
                 } else {
                     // Slow path: scatter to non-contiguous positions
                     for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                        const void * src = io.read(cell_count * v_size_el);
                         for (uint32_t i = 0; i < cell_count; ++i) {
                             const size_t dst_offset = (sinfo.idxs[0][i] + j * cells.size()) * v_size_el;
-                            ggml_backend_tensor_set(v, (const char*)src + i * v_size_el, dst_offset, v_size_el);
+                            io.read_tensor(v, dst_offset, v_size_el);
                         }
                     }
                 }
