@@ -2003,7 +2003,7 @@ private:
 
                     // MoE expert cache stats
                     {
-                        auto moe_stats = llama_moe_cache_get_stats(ctx);
+                        auto moe_stats = llama_moe_cache_get_stats(ctx_tgt);
                         res->moe_cache_hits      = moe_stats.hits;
                         res->moe_cache_misses    = moe_stats.misses;
                         res->moe_cache_evictions = moe_stats.evictions;
