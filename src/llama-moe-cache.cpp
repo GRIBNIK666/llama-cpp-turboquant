@@ -119,7 +119,7 @@ bool llama_moe_cache::init(const llama_moe_cache_config & config,
 
     n_cache_experts_     = config.n_cache_experts;
     n_experts_per_layer_ = hparams.n_expert;
-    n_layers_            = hparams.n_layer;
+    n_layers_            = hparams.n_layer();
     policy_              = config.eviction_policy;
 
     if (policy_ == LLAMA_MOE_CACHE_SLRU) {
